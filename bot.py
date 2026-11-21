@@ -570,7 +570,7 @@ class Bot:
         elif tgt is not None:
             mode = "fight"
             d = dist2(tgt["pos"], pos)
-            want = 30 if "lightning" in held else 70
+            want = 25 if "lightning" in held else 35  # TEST v12 brawl: close range, where our hits land and lightning works
             if tgt.get("kind") == "npc":
                 want = 25 if "lightning" in held else 40
             to = math.atan2(tgt["pos"][1] - pos[1], tgt["pos"][0] - pos[0])
@@ -587,8 +587,10 @@ class Bot:
                 radial = -0.8
             mx = math.cos(perp) * 0.8 + math.cos(to) * radial
             my = math.sin(perp) * 0.8 + math.sin(to) * radial
-            if d > want + 40:
+            if d > want + 40 or (tgt.get("kind") == "mech" and not self.can_hit(me, tgt)):
+                # TEST v12 brawl: close in fast, and chase round corners instead of waiting
                 move = self.go(me, t, tgt["pos"])
+                boost = me["energy"] > 50 and tgt.get("kind") == "mech"
             else:
                 if self.nav is not None and not self.nav.line_free(pos, (pos[0] + mx * 6, pos[1] + my * 6)):
                     # strafing into a wall: switch sides
@@ -622,6 +624,10 @@ class Bot:
                 if dist2(c["pos"], pos) < 80:
                     goal = c["pos"]
                     mode = "cube"
+            if goal is None and self.threat is not None and hp_frac > 0.6 and self.in_circle(self.threat[:2], zc, zr):
+                # TEST v14 hunt: a heard or shooting hunter is nearby -> go meet it while it is alone
+                goal = self.threat[:2]
+                mode = "hunt"
             if goal is None and obs.get("crates") and me["cubes"] < 10:
                 c = min(obs["crates"], key=lambda c: dist2(c["pos"], pos))
                 if dist2(c["pos"], pos) < 60 and abs(c["pos"][2] - pos[2]) < 4:
