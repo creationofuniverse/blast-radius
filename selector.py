@@ -100,6 +100,7 @@ class Ctx:
         self.special_typing = {self.num_by_id[SPECIAL_TYPING]} if SPECIAL_TYPING in self.num_by_id else set()
         self.special_lazy = {self.num_by_id[SPECIAL_LAZY]} if SPECIAL_LAZY in self.num_by_id else set()
         self._src_cache = {}
+        self.patched = {}
         self.import_lines = {f: set(v) for f, v in idx.get("import_lines", {}).items()}
         self.testwords = {w: self.sets[i] for w, i in idx.get("testwords", {}).items()}
 
@@ -429,6 +430,7 @@ def select_python(ctx, rel, f, reasons):
     except SyntaxError:
         reasons.append(f"{rel}: does not parse -> all")
         return set(ctx.all)
+    ctx.patched[rel] = new_src
     old_lines = old_src.split("\n")
     new_lines = new_src.split("\n")
     old_funcs = qual_funcs(old_tree)
@@ -480,9 +482,13 @@ def select_python(ctx, rel, f, reasons):
         stmt = statement_in(tree, line)
         if isinstance(stmt, (ast.Import, ast.ImportFrom)):
             s |= set(ctx.all)
+        # tests that ran the changed line itself (lambdas and calls inside tables run under the test)
+        for ln in range(max(line - 1, 1), line + 2):
+            s |= cov.get(ln, set())
         if stem:
-            s2 = s & ctx.stems[stem]
-            s = s2 if s2 else set(ctx.stems[stem])
+            # class tables are often copied or renamed when the class is built, so names can't be
+            # traced reliably: every test that uses this dialect (or one built on it)
+            s = set(ctx.stems[stem]) | (s & ctx.stems[stem])
         s |= direct
         if not s:
             s = set(ctx.all)
@@ -542,13 +548,12 @@ def select_python(ctx, rel, f, reasons):
                 if not s:
                     s = set(ctx.all)
                 return s
-            if side == "old" and not coarse:
+            if side == "old":
                 f = fine(line, s)
                 if f is None:  # runs at import or test collection: a failure there takes whole test files down
                     module_level = True
                     return set(ctx.all)
-                return f
-            return s
+            return s  # every test that ran the function, not only the changed statement
         hd = header(funcs, line)
         if hd is not None:
             q, b_, e_, h_, node, cl = hd
@@ -675,6 +680,7 @@ def select_test_file(ctx, rel, f, reasons):
 
 
 def select_commit(ctx, text, reasons):
+    ctx.patched = {}
     files = parse_patch(text)
     if not files:
         reasons.append("empty patch")
@@ -734,6 +740,66 @@ def split(ctx, sel):
     return best[1], best[0]
 
 
+CHECK_ROOT = Path("/tmp/brcheck")
+CHECK_CODE = r"""
+import importlib, sys
+mods, stems = sys.argv[1].split(","), [x for x in sys.argv[2].split(",") if x]
+import sqlglot
+for m in mods:
+    if m:
+        importlib.import_module(m)
+from sqlglot.dialects.dialect import Dialect
+for s in stems:
+    d = Dialect.get_or_raise(s)
+    sqlglot.parse_one("SELECT a, b FROM t WHERE a = 1", read=s).sql(dialect=s)
+print("ok")
+"""
+
+
+def import_check(ctx, reasons):
+    """Import the patched modules for real: code that breaks at import takes whole test
+    files down, and no coverage map can see that coming."""
+    import shutil
+    import subprocess
+
+    if not ctx.patched:
+        return True
+    pkg = CHECK_ROOT / "sqlglot"
+    if not pkg.exists():
+        # plain copies: the source tree is read-only and its modes must not come along
+        shutil.copytree(SRC / "sqlglot", pkg, copy_function=shutil.copyfile,
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        for d, _, _ in os.walk(pkg):
+            os.chmod(d, 0o755)
+    mods, stems = [], []
+    for rel, src in ctx.patched.items():
+        (CHECK_ROOT / rel).write_text(src, encoding="utf-8")
+        mod = rel[:-3].replace("/", ".")
+        if mod.endswith(".__init__"):
+            mod = mod[: -len(".__init__")]
+        mods.append(mod)
+        st = dialect_stem(rel, ctx)
+        if st:
+            stems.append(st)
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c", CHECK_CODE, ",".join(mods), ",".join(stems)],
+            capture_output=True, text=True, timeout=30,
+            env={"PYTHONPATH": str(CHECK_ROOT), "HOME": "/tmp", "PATH": os.environ.get("PATH", "")},
+            cwd="/tmp",
+        )
+        ok = r.returncode == 0 and r.stdout.strip().endswith("ok")
+        if not ok:
+            reasons.append("import check failed -> all: " + (r.stderr.strip().splitlines() or ["?"])[-1][:120])
+    except Exception as e:
+        ok = False
+        reasons.append(f"import check error {e!r} -> all")
+    finally:
+        for rel in ctx.patched:
+            shutil.copyfile(SRC / rel, CHECK_ROOT / rel)
+    return ok
+
+
 def main():
     ctx = Ctx()
     total = 0
@@ -741,6 +807,8 @@ def main():
         reasons = []
         try:
             sel = select_commit(ctx, patch.read_text("utf-8", errors="replace"), reasons)
+            if sel != ctx.all and ctx.patched and not import_check(ctx, reasons):
+                sel = set(ctx.all)
         except Exception as e:  # never crash: run everything
             reasons.append(f"error {e!r} -> all")
             sel = set(ctx.all)
