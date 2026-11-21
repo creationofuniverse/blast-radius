@@ -22,6 +22,7 @@ DATA = Path(os.environ.get("BR_DATA", "/data"))
 SRC = Path(os.environ.get("BR_SRC", "/opt/sqlglot"))
 MAP = Path(os.environ.get("BR_MAP", Path(__file__).with_name("map.json.gz")))
 
+MAX_CHANGED_LINES = 1500
 DIALECT_DIRS = ("dialects", "parsers", "generators", "tokenizers", "typing")
 SPECIAL_TYPING = "tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata"
 SPECIAL_LAZY = "tests/dialects/test_dialect.py::TestDialect::test_lazy_load"
@@ -103,6 +104,42 @@ class Ctx:
         self.patched = {}
         self.import_lines = {f: set(v) for f, v in idx.get("import_lines", {}).items()}
         self.testwords = {w: self.sets[i] for w, i in idx.get("testwords", {}).items()}
+        self._importers = {}
+        self._range_cache = {}
+        # tests whose own code names a dialect (read="duckdb", write={"spark": ...}, DuckDB())
+        named = {}
+        for w, s in self.testwords.items():
+            lw = w.lower()
+            if lw in self.stems:
+                named.setdefault(lw, set()).update(s)
+        # dialect subclassing, read from the pinned sources: class Spark2(Hive) -> hive's users include spark2's
+        cls_stem, parent = {}, {}
+        for stem in self.stems:
+            src = self.source(f"sqlglot/dialects/{stem}.py") or ""
+            for cname, base in re.findall(r"^class\s+(\w+)\((?:[\w.]*\.)?(\w+)\)\s*:", src, re.M):
+                cls_stem[cname] = stem
+                parent[stem] = base
+        children = {}
+        for stem, base in parent.items():
+            b = cls_stem.get(base)
+            if b and b != stem:
+                children.setdefault(b, set()).add(stem)
+
+        def family(stem, seen=None):
+            seen = seen if seen is not None else set()
+            if stem in seen:
+                return seen
+            seen.add(stem)
+            for c in children.get(stem, ()):
+                family(c, seen)
+            return seen
+
+        self.stem_users = {}
+        for k, v in self.stems.items():
+            u = set(v)
+            for st in family(k):
+                u |= named.get(st, set())
+            self.stem_users[k] = u
 
     def source(self, rel):
         if rel not in self._src_cache:
@@ -179,17 +216,28 @@ def parse_patch(text):
     return files
 
 
+class PatchMismatch(ValueError):
+    pass
+
+
 def apply_hunks(old_text, hunks):
+    """Apply hunks to the pinned source. Raises PatchMismatch when a context or removed line
+    differs from the pinned file: the patch is against other code, so no line map holds."""
     old = old_text.split("\n")
     out = []
     pos = 0  # 0-based index into old
     for start, body in hunks:
         s = max(start - 1, 0)
+        if s < pos:
+            raise PatchMismatch("overlapping hunks")
         out.extend(old[pos:s])
         pos = s
         for tag, l in body:
+            if tag in (" ", "-"):
+                if pos >= len(old) or old[pos] != l:
+                    raise PatchMismatch(f"line {pos + 1} differs")
             if tag == " ":
-                out.append(old[pos] if pos < len(old) else l)
+                out.append(old[pos])
                 pos += 1
             elif tag == "-":
                 pos += 1
@@ -334,12 +382,16 @@ def dialect_stem(rel, ctx):
 
 
 def tests_in_range(ctx, rel, a, b):
-    d = ctx.lines.get(rel, {})
-    s = set()
-    for ln, ts in d.items():
-        if a <= ln <= b:
-            s |= ts
-    return s
+    key = (rel, a, b)
+    hit = ctx._range_cache.get(key)
+    if hit is None:
+        d = ctx.lines.get(rel, {})
+        hit = set()
+        for ln, ts in d.items():
+            if a <= ln <= b:
+                hit |= ts
+        ctx._range_cache[key] = hit
+    return set(hit)
 
 
 def qual_funcs(tree):
@@ -424,6 +476,11 @@ def select_python(ctx, rel, f, reasons):
     if a is not None and b is not None and a == b:
         reasons.append(f"{rel}: comments/blank only")
         return set()
+    n_changed = sum(1 for _, body in f["hunks"] for tag, _ in body if tag != " ")
+    if n_changed > MAX_CHANGED_LINES:
+        # a rewrite this large reaches nearly every test anyway; keep the CPU bill small
+        reasons.append(f"{rel}: {n_changed} changed lines -> all")
+        return set(ctx.all)
     try:
         old_tree = ast.parse(old_src)
         new_tree = ast.parse(new_src)
@@ -439,6 +496,8 @@ def select_python(ctx, rel, f, reasons):
     for q, b_, e_, h_, node, cl in old_funcs:
         old_by_q[q] = (b_, e_, h_, node, cl)
     old_classes = class_ranges(old_tree)
+    old_cls = [c for c in ast.walk(old_tree) if isinstance(c, ast.ClassDef)]
+    new_cls = [c for c in ast.walk(new_tree) if isinstance(c, ast.ClassDef)]
     stem = dialect_stem(rel, ctx)
     wi = ctx.word_index()
 
@@ -488,7 +547,7 @@ def select_python(ctx, rel, f, reasons):
         if stem:
             # class tables are often copied or renamed when the class is built, so names can't be
             # traced reliably: every test that uses this dialect (or one built on it)
-            s = set(ctx.stems[stem]) | (s & ctx.stems[stem])
+            s = set(ctx.stem_users[stem]) | (s & ctx.stem_users[stem])
         s |= direct
         if not s:
             s = set(ctx.all)
@@ -544,7 +603,7 @@ def select_python(ctx, rel, f, reasons):
                     outer = outer.rsplit(".", 1)[0] if "." in outer else None
                 module_level = True
                 if stem:
-                    s = (s & ctx.stems[stem]) or set(ctx.stems[stem])
+                    s = (s & ctx.stem_users[stem]) or set(ctx.stem_users[stem])
                 if not s:
                     s = set(ctx.all)
                 return s
@@ -560,13 +619,13 @@ def select_python(ctx, rel, f, reasons):
             s = func_tests(q, node.name) or set()
             s |= wi.get(node.name, set())
             if stem:
-                s = (s & ctx.stems[stem]) | (func_tests(q, node.name) or set())
+                s = (s & ctx.stem_users[stem]) | (func_tests(q, node.name) or set())
             if not s:
-                s = set(ctx.stems[stem]) if stem else set(ctx.all)
+                s = set(ctx.stem_users[stem]) if stem else set(ctx.all)
             module_level = True
             return s
         module_level = True
-        classes_here = [c.name for c in ast.walk(tree) if isinstance(c, ast.ClassDef) and c.lineno <= line <= c.end_lineno]
+        classes_here = [c.name for c in (old_cls if tree is old_tree else new_cls) if c.lineno <= line <= c.end_lineno]
         return level_tests(tree, line, text, classes_here)
 
     def nearest_code(line, step):
@@ -645,28 +704,55 @@ def statement_in(tree, line):
         return found
 
 
+def test_importers(ctx, rel):
+    """-> (names imported from this test module by other test files, their tests).
+    e.g. tests/dialects/test_dialect.py defines Validator, which every dialect test file uses."""
+    if rel in ctx._importers:
+        return ctx._importers[rel]
+    mod = re.escape(rel[:-3].replace("/", "."))
+    pat = re.compile(r"^\s*(?:from\s+" + mod + r"\s+import\s+\(?([^\n)]*)|import\s+" + mod + r"\b)", re.M)
+    names, tests = set(), set()
+    for tf, nums in ctx.by_file.items():
+        if tf == rel:
+            continue
+        src = ctx.source(tf) or ""
+        hits = pat.findall(src)
+        if hits:
+            tests |= nums
+            for h in hits:
+                names |= set(re.findall(r"[A-Za-z_][A-Za-z_0-9]*", h)) or {"*"}
+    ctx._importers[rel] = (names, tests)
+    return ctx._importers[rel]
+
+
 def select_test_file(ctx, rel, f, reasons):
-    """a change to a test module: the tests whose bodies changed, or the whole file."""
+    """a change to a test module: the tests whose bodies changed, or the whole file
+    (plus every test file that imports from it when the change is outside a test)."""
     own = ctx.by_file.get(rel)
     old_src = ctx.source(rel)
     if own is None or old_src is None:
         return None
     try:
         new_src = apply_hunks(old_src, f["hunks"])
-        if code_tokens(old_src) == code_tokens(new_src) and code_tokens(old_src) is not None:
-            reasons.append(f"{rel}: comments only")
-            return set()
     except Exception:
-        pass
+        reasons.append(f"{rel}: patch does not apply -> all")
+        return set(ctx.all)
+    a, b = code_tokens(old_src), code_tokens(new_src)
+    if a is not None and a == b:
+        reasons.append(f"{rel}: comments only")
+        return set()
+    imp_names, imp_tests = test_importers(ctx, rel)
+    wide = set(own) | imp_tests
     st = Structure(old_src)
     sel = set()
     for line in changed_old_lines(f["hunks"]):
-        fn = st.innermost_func(line)
+        fn = st.innermost_func(line) or st.def_header(line)
         hit = None
         if fn is not None:
-            node = fn[3]
             # the outermost function inside a class, named test_*
             for c in st.enclosing_classes(line):
+                if c.name in imp_names or "*" in imp_names:
+                    continue  # a class other files import (and may subclass): not just one test
                 for item in c.body:
                     if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.lineno <= line <= item.end_lineno:
                         if item.name.startswith("test"):
@@ -674,7 +760,9 @@ def select_test_file(ctx, rel, f, reasons):
                             if tid in ctx.num_by_id:
                                 hit = {ctx.num_by_id[tid]}
         if hit is None:
-            return set(own)
+            if imp_tests:
+                reasons.append(f"{rel}: shared test code -> {len(wide)} tests")
+            return wide
         sel |= hit
     return sel
 
@@ -683,8 +771,15 @@ def select_commit(ctx, text, reasons):
     ctx.patched = {}
     files = parse_patch(text)
     if not files:
+        # diff-looking text we could not read (no "diff --git" header): never run nothing
+        if re.search(r"^(--- |\+\+\+ |@@ |Index: |Binary files |GIT binary patch)", text, re.M):
+            reasons.append("unrecognized diff -> all")
+            return set(ctx.all)
         reasons.append("empty patch")
         return set()
+    if any(not f["hunks"] and not f["binary"] and f["status"] == "modified" for f in files):
+        reasons.append("file header without hunks -> all")
+        return set(ctx.all)
     sel = set()
     for f in files:
         rel = f["new"] if f["status"] != "deleted" else f["old"]
@@ -773,6 +868,7 @@ def import_check(ctx, reasons):
             os.chmod(d, 0o755)
     mods, stems = [], []
     for rel, src in ctx.patched.items():
+        _drop_pyc(rel)  # .pyc freshness is mtime(seconds)+size: a same-size rewrite could reuse it
         (CHECK_ROOT / rel).write_text(src, encoding="utf-8")
         mod = rel[:-3].replace("/", ".")
         if mod.endswith(".__init__"):
@@ -796,26 +892,100 @@ def import_check(ctx, reasons):
         reasons.append(f"import check error {e!r} -> all")
     finally:
         for rel in ctx.patched:
+            _drop_pyc(rel)
             shutil.copyfile(SRC / rel, CHECK_ROOT / rel)
     return ok
 
 
+def _drop_pyc(rel):
+    p = CHECK_ROOT / rel
+    cache = p.parent / "__pycache__"
+    if cache.is_dir():
+        for c in cache.glob(p.stem + ".*.pyc"):
+            try:
+                c.unlink()
+            except OSError:
+                pass
+
+
+def list_commits():
+    """-> [(commit id, patch text)], one per commit, whatever the layout of /data/commits:
+    <id>.patch / <id>.diff / <id> files, or <id>/ directories holding the patch."""
+    root = DATA / "commits"
+    out, seen = [], set()
+    entries = sorted(root.glob("*.patch")) or sorted(root.glob("*.diff")) or sorted(root.iterdir())
+    for p in entries:
+        if p.name.startswith("."):
+            continue
+        cid = p.name.split(".", 1)[0] if p.is_file() else p.name
+        if not cid or cid in seen:
+            continue
+        try:
+            if p.is_dir():
+                parts = [q.read_text("utf-8", errors="replace") for q in sorted(p.rglob("*")) if q.is_file()]
+                text = "\n".join(parts)
+            else:
+                text = p.read_text("utf-8", errors="replace")
+        except Exception as e:
+            log(cid, f"unreadable {e!r}")
+            text = None
+        seen.add(cid)
+        out.append((cid, text))
+    return out
+
+
+def all_numbers():
+    """test numbers straight from tests.json, for when the full setup fails."""
+    try:
+        raw = json.loads((DATA / "tests.json").read_text())
+        tests = raw["tests"] if isinstance(raw, dict) else raw
+        return [t["number"] for t in tests if isinstance(t.get("number"), int)]
+    except Exception as e:
+        log(f"tests.json unreadable {e!r}")
+        return []
+
+
+def emit(cid, workers):
+    sys.stdout.write(json.dumps({"commit": cid, "workers": workers}) + "\n")
+    sys.stdout.flush()
+
+
 def main():
-    ctx = Ctx()
+    try:
+        commits = list_commits()
+    except Exception as e:
+        log(f"cannot list commits {e!r}")
+        return
+    try:
+        ctx = Ctx()
+    except Exception as e:  # never print nothing: run every test on every commit
+        log(f"setup failed {e!r} -> all tests for every commit")
+        nums = all_numbers()
+        workers = [w for w in (nums[i::8] for i in range(8)) if w]
+        for cid, _ in commits:
+            emit(cid, workers)
+        return
     total = 0
-    for patch in sorted((DATA / "commits").glob("*.patch")):
+    for cid, text in commits:
         reasons = []
         try:
-            sel = select_commit(ctx, patch.read_text("utf-8", errors="replace"), reasons)
+            if text is None:
+                raise ValueError("unreadable patch")
+            sel = select_commit(ctx, text, reasons)
             if sel != ctx.all and ctx.patched and not import_check(ctx, reasons):
                 sel = set(ctx.all)
         except Exception as e:  # never crash: run everything
             reasons.append(f"error {e!r} -> all")
             sel = set(ctx.all)
-        workers, cost = split(ctx, sel)
+        try:
+            workers, cost = split(ctx, sel)
+        except Exception as e:
+            reasons.append(f"split error {e!r}")
+            nums = sorted(ctx.all)
+            workers, cost = [w for w in (nums[i::8] for i in range(8)) if w], 0
         total += cost
-        print(json.dumps({"commit": patch.stem, "workers": workers}), flush=True)
-        log(patch.stem, f"{cost / 1000:.1f}s", "; ".join(reasons))
+        emit(cid, workers)
+        log(cid, f"{cost / 1000:.1f}s", "; ".join(reasons))
     log(f"estimated simulated total {total / 1000:.1f}s")
 
 
