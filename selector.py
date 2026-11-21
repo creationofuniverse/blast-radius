@@ -147,6 +147,41 @@ class Ctx:
             self._src_cache[rel] = p.read_text("utf-8") if p.exists() else None
         return self._src_cache[rel]
 
+    def class_users(self, name):
+        """tests that can hold an instance of class `name` or of a subclass: code lines and test
+        code naming any of them, plus their SQL function names (ArrayContains -> ARRAY_CONTAINS)."""
+        if not hasattr(self, "_children"):
+            children = {}
+            for p in (SRC / "sqlglot").rglob("*.py"):
+                try:
+                    src = p.read_text("utf-8")
+                except Exception:
+                    continue
+                for cname, bases in re.findall(r"^\s*class\s+(\w+)\s*\(([^)]*)\)\s*:", src, re.M):
+                    for b in re.findall(r"(\w+)\s*(?:,|$)", bases):
+                        children.setdefault(b, set()).add(cname)
+            self._children = children
+            low = {}
+            for w, s in self.testwords.items():
+                low.setdefault(w.lower(), set()).update(s)
+            self._testwords_lower = low
+        names, todo = set(), [name]
+        while todo:
+            n = todo.pop()
+            if n in names:
+                continue
+            names.add(n)
+            todo.extend(self._children.get(n, ()))
+        wi = self.word_index()
+        out = set()
+        for n in names:
+            out |= wi.get(n, set())
+            out |= self.testwords.get(n, set())
+            snake = re.sub(r"(?<!^)(?=[A-Z])", "_", n).lower()
+            out |= self._testwords_lower.get(snake, set())
+            out |= self._testwords_lower.get(n.lower(), set())
+        return out
+
     def word_index(self):
         """identifier -> tests covering a sqlglot line that mentions it."""
         if self._word_index is None:
@@ -487,6 +522,11 @@ def select_python(ctx, rel, f, reasons):
     except SyntaxError:
         reasons.append(f"{rel}: does not parse -> all")
         return set(ctx.all)
+    try:
+        compile(new_src, rel, "exec", dont_inherit=True)  # errors ast.parse lets through
+    except (SyntaxError, ValueError):
+        reasons.append(f"{rel}: does not compile -> all")
+        return set(ctx.all)
     ctx.patched[rel] = new_src
     old_lines = old_src.split("\n")
     new_lines = new_src.split("\n")
@@ -502,6 +542,7 @@ def select_python(ctx, rel, f, reasons):
     wi = ctx.word_index()
 
     sel = set()
+    touched = set()
     module_level = False
 
     def innermost(funcs, line):
@@ -544,6 +585,20 @@ def select_python(ctx, rel, f, reasons):
         # tests that ran the changed line itself (lambdas and calls inside tables run under the test)
         for ln in range(max(line - 1, 1), line + 2):
             s |= cov.get(ln, set())
+        # a plain attribute of one class (arg_types, a flag, a table) only reaches code that holds
+        # that class or a subclass: the tests that name it, build it, or run its methods
+        cls_list = old_cls if tree is old_tree else new_cls
+        inner = max((c for c in cls_list if c.lineno <= line <= c.end_lineno), key=lambda c: c.lineno, default=None)
+        if (not stem and inner is not None and stmt is not None and any(stmt is b for b in inner.body)
+                and isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign))):
+            narrowed = ctx.class_users(inner.name)
+            for (cb, ce) in old_classes.get(inner.name, []):
+                narrowed |= tests_in_range(ctx, rel, cb, ce)
+            if tree is old_tree:
+                for ln in range(max(line - 1, 1), line + 2):
+                    narrowed |= cov.get(ln, set())
+            if narrowed:
+                return narrowed
         if stem:
             # class tables are often copied or renamed when the class is built, so names can't be
             # traced reliably: every test that uses this dialect (or one built on it)
@@ -591,6 +646,7 @@ def select_python(ctx, rel, f, reasons):
         fn = innermost(funcs, line)
         if fn is not None:
             q, b_, e_, h_, node, cl = fn
+            touched.add(q)
             s = func_tests(q, node.name)
             if s is None:  # a function that is new in this patch: who calls or overrides it
                 s = set(wi.get(node.name, set()))
@@ -672,6 +728,27 @@ def select_python(ctx, rel, f, reasons):
             continue
         for l in run["added"]:
             sel |= handle(l, new_lines, new_funcs, new_tree, "new", coarse=True)
+    # the real import check is only needed when the change can run while modules load:
+    # module or class level code, a new function, a function that runs at import, or a module
+    # whose import-time lines the map credits to tests (dialects and other lazily loaded modules)
+    need = module_level or bool(stem) or not imp or rel.endswith("__init__.py")
+    for q in touched:
+        if need:
+            break
+        if q not in old_by_q:
+            need = True
+        else:
+            b_, e_, h_, _n, _c = old_by_q[q]
+            # def/class/decorator lines of nested definitions run when the outer one is defined,
+            # not when it is called: only body lines say the function itself ran at import
+            heads = set()
+            for sub in ast.walk(_n):
+                if sub is not _n and isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    hs = min([d.lineno for d in sub.decorator_list] + [sub.lineno])
+                    heads.update(range(hs, sub.body[0].lineno))
+            need = any(b_ <= l <= e_ and l not in heads for l in imp)
+    if need:
+        ctx.need_import = True
     if module_level:
         sel |= ctx.special_lazy
     if rel.startswith("sqlglot/typing/"):
@@ -769,6 +846,7 @@ def select_test_file(ctx, rel, f, reasons):
 
 def select_commit(ctx, text, reasons):
     ctx.patched = {}
+    ctx.need_import = False
     files = parse_patch(text)
     if not files:
         # diff-looking text we could not read (no "diff --git" header): never run nothing
@@ -972,7 +1050,7 @@ def main():
             if text is None:
                 raise ValueError("unreadable patch")
             sel = select_commit(ctx, text, reasons)
-            if sel != ctx.all and ctx.patched and not import_check(ctx, reasons):
+            if sel != ctx.all and ctx.patched and ctx.need_import and not import_check(ctx, reasons):
                 sel = set(ctx.all)
         except Exception as e:  # never crash: run everything
             reasons.append(f"error {e!r} -> all")
