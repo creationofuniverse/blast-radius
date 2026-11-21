@@ -1050,6 +1050,160 @@ print("ok")
 """
 
 
+# One long-lived helper loads the standard-library modules sqlglot needs (never sqlglot itself),
+# then forks a child per commit that runs exactly CHECK_CODE. Each child imports sqlglot from
+# scratch like a fresh interpreter would, but skips starting Python and loading the standard
+# library again. Anything unusual about the helper -> the plain fresh-interpreter check.
+SERVER_CODE = r"""
+import json, os, signal, sys, importlib
+code = sys.argv[1]
+proto = os.fdopen(os.dup(1), "w")
+_null = os.open(os.devnull, os.O_WRONLY)
+os.dup2(_null, 1)
+
+def run(mods, stems):
+    old = sys.argv
+    try:
+        importlib.invalidate_caches()
+        sys.argv = ["-c", ",".join(mods), ",".join(stems)]
+        g = {"__name__": "__main__"}
+        exec(compile(code, "<check>", "exec"), g)
+        return {"ok": True}
+    except BaseException as e:
+        return {"ok": False, "msg": (type(e).__name__ + ": " + str(e))[:200]}
+    finally:
+        sys.argv = old
+
+def in_child(fn):
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        try:
+            signal.alarm(20)
+            out = json.dumps(fn()).encode()
+        except BaseException:
+            out = b'{"ok": false, "msg": "child"}'
+        os.write(w, out)
+        os._exit(0)
+    os.close(w)
+    chunks = []
+    while True:
+        c = os.read(r, 65536)
+        if not c:
+            break
+        chunks.append(c)
+    os.close(r)
+    os.waitpid(pid, 0)
+    return json.loads(b"".join(chunks).decode() or '{"ok": false, "msg": "child died"}')
+
+def stdlib_names():
+    # which modules does importing sqlglot pull in? (asked in a throwaway child)
+    import sqlglot
+    from sqlglot.dialects.dialect import Dialect
+    for d in ("duckdb", "snowflake", "bigquery"):
+        Dialect.get_or_raise(d)
+    return {"ok": True, "mods": sorted(m for m in sys.modules if m.split(".")[0] != "sqlglot" and m != "__main__")}
+
+def preload(names):
+    for m in names:
+        try:
+            importlib.import_module(m)
+        except BaseException:
+            pass
+
+if len(sys.argv) > 2:  # one request without fork (local tests)
+    if sys.argv[3] == "1":
+        try:
+            preload(stdlib_names()["mods"])
+        except BaseException:
+            pass
+        for m in [m for m in sys.modules if m.split(".")[0] == "sqlglot"]:
+            del sys.modules[m]
+    req = json.loads(sys.argv[2])
+    proto.write(json.dumps(run(req["mods"], req["stems"])) + "\n"); proto.flush()
+    os._exit(0)
+info = in_child(stdlib_names)
+preload(info.get("mods", []))
+if any(m.split(".")[0] == "sqlglot" for m in sys.modules):
+    raise SystemExit("sqlglot leaked into the helper")
+proto.write("ready\n"); proto.flush()
+for line in sys.stdin:
+    req = json.loads(line)
+    res = in_child(lambda: run(req["mods"], req["stems"]))
+    proto.write(json.dumps(res) + "\n"); proto.flush()
+"""
+
+
+class CheckServer:
+    def __init__(self, env):
+        import subprocess
+
+        self.proc = subprocess.Popen(
+            [sys.executable, "-c", SERVER_CODE, CHECK_CODE],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, env=env, cwd="/tmp",
+        )
+        if self._line(60) != "ready":
+            self.close()
+            raise RuntimeError("check server did not start")
+
+    def _line(self, timeout):
+        import threading
+
+        box = []
+        t = threading.Thread(target=lambda: box.append(self.proc.stdout.readline()), daemon=True)
+        t.start()
+        t.join(timeout)
+        if not box:
+            raise TimeoutError("check server timeout")
+        return box[0].strip()
+
+    def ask(self, mods, stems):
+        self.proc.stdin.write(json.dumps({"mods": mods, "stems": stems}) + "\n")
+        self.proc.stdin.flush()
+        return json.loads(self._line(30))
+
+    def close(self):
+        try:
+            self.proc.kill()
+        except Exception:
+            pass
+
+
+_server = [None, False]  # [helper, gave up on it]
+
+
+def check_env():
+    return {"PYTHONPATH": str(CHECK_ROOT), "HOME": "/tmp", "PATH": os.environ.get("PATH", "")}
+
+
+def prepare_check_root():
+    import shutil
+
+    pkg = CHECK_ROOT / "sqlglot"
+    if not pkg.exists():
+        # plain copies: the source tree is read-only and its modes must not come along
+        shutil.copytree(SRC / "sqlglot", pkg, copy_function=shutil.copyfile,
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        for d, _, _ in os.walk(pkg):
+            os.chmod(d, 0o755)
+
+
+def get_server():
+    if _server[0] is None and not _server[1]:
+        if not hasattr(os, "fork"):
+            _server[1] = True
+            return None
+        try:
+            prepare_check_root()
+            _server[0] = CheckServer(check_env())
+        except Exception as e:
+            log(f"check server unavailable {e!r}")
+            _server[1] = True
+    return _server[0]
+
+
 def import_check(ctx, reasons):
     """Import the patched modules for real: code that breaks at import takes whole test
     files down, and no coverage map can see that coming."""
@@ -1058,13 +1212,8 @@ def import_check(ctx, reasons):
 
     if not ctx.patched:
         return True
-    pkg = CHECK_ROOT / "sqlglot"
-    if not pkg.exists():
-        # plain copies: the source tree is read-only and its modes must not come along
-        shutil.copytree(SRC / "sqlglot", pkg, copy_function=shutil.copyfile,
-                        ignore=shutil.ignore_patterns("__pycache__"))
-        for d, _, _ in os.walk(pkg):
-            os.chmod(d, 0o755)
+    server = get_server()
+    prepare_check_root()
     mods, stems = [], []
     for rel, src in ctx.patched.items():
         _drop_pyc(rel)  # .pyc freshness is mtime(seconds)+size: a same-size rewrite could reuse it
@@ -1077,15 +1226,28 @@ def import_check(ctx, reasons):
         if st:
             stems.append(st)
     try:
-        r = subprocess.run(
-            [sys.executable, "-c", CHECK_CODE, ",".join(mods), ",".join(stems)],
-            capture_output=True, text=True, timeout=30,
-            env={"PYTHONPATH": str(CHECK_ROOT), "HOME": "/tmp", "PATH": os.environ.get("PATH", "")},
-            cwd="/tmp",
-        )
-        ok = r.returncode == 0 and r.stdout.strip().endswith("ok")
-        if not ok:
-            reasons.append("import check failed -> all: " + (r.stderr.strip().splitlines() or ["?"])[-1][:120])
+        ok = None
+        if server is not None:
+            try:
+                res = server.ask(mods, stems)
+                ok = bool(res.get("ok"))
+                if not ok:
+                    reasons.append("import check failed -> all: " + str(res.get("msg", "?"))[:120])
+            except Exception as e:  # helper broke: never use it again
+                server.close()
+                _server[0], _server[1] = None, True
+                log(f"check server failed {e!r}")
+                if isinstance(e, TimeoutError):
+                    ok = False
+                    reasons.append("import check timeout -> all")
+        if ok is None:
+            r = subprocess.run(
+                [sys.executable, "-c", CHECK_CODE, ",".join(mods), ",".join(stems)],
+                capture_output=True, text=True, timeout=30, env=check_env(), cwd="/tmp",
+            )
+            ok = r.returncode == 0 and r.stdout.strip().endswith("ok")
+            if not ok:
+                reasons.append("import check failed -> all: " + (r.stderr.strip().splitlines() or ["?"])[-1][:120])
     except Exception as e:
         ok = False
         reasons.append(f"import check error {e!r} -> all")
@@ -1186,6 +1348,8 @@ def main():
         emit(cid, workers)
         log(cid, f"{cost / 1000:.1f}s", "; ".join(reasons))
     log(f"estimated simulated total {total / 1000:.1f}s")
+    if _server[0] is not None:
+        _server[0].close()
 
 
 if __name__ == "__main__":
