@@ -147,6 +147,108 @@ class Ctx:
             self._src_cache[rel] = p.read_text("utf-8") if p.exists() else None
         return self._src_cache[rel]
 
+    def derived_attrs(self, start, limit=80):
+        """Follow where class attributes flow: every attribute or class-level name that is set by a
+        statement reading one of `start` (or reading a local computed from it), across all of
+        sqlglot, until nothing new appears. e.g. NUMERIC_ESCAPES -> (local numeric_escapes ->
+        fmt ->) ESCAPED_SEQUENCES. Returns None when the flow spreads too wide to be useful."""
+        if not hasattr(self, "_pyfiles"):
+            self._pyfiles = {}
+            for p in (SRC / "sqlglot").rglob("*.py"):
+                try:
+                    self._pyfiles[p] = [p.read_text("utf-8"), None]
+                except Exception:
+                    pass
+        MUT = {"setdefault", "update", "append", "extend", "add", "insert", "pop", "remove",
+               "discard", "clear", "__setitem__", "popitem"}
+
+        def scopes(tree):
+            fs = []
+
+            def collect(body, out):
+                for st in body:
+                    if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        # only code that runs while classes are built can copy an attribute
+                        # somewhere else; what ordinary methods read at run time is in the
+                        # coverage map already
+                        if st.name in ("__new__", "__init_subclass__", "__set_name__", "__init__"):
+                            inner = []
+                            collect(st.body, inner)
+                            fs.append((False, inner))
+                    elif isinstance(st, ast.ClassDef):
+                        collect(st.body, out)  # class level shares the module-level scope
+                    else:
+                        out.append(st)
+                        for fld in ("body", "orelse", "finalbody"):
+                            sub = getattr(st, fld, None)
+                            if isinstance(sub, list):
+                                collect(sub, out)
+                        for h in getattr(st, "handlers", []) or []:
+                            collect(h.body, out)
+                        for c in getattr(st, "cases", []) or []:
+                            collect(c.body, out)
+            mod = []
+            collect(tree.body, mod)
+            return [(True, mod)] + fs
+
+        def info(st):
+            ment, loc, glo = set(), set(), set()
+            comp = {x.id for c in ast.walk(st) if isinstance(c, ast.comprehension)
+                    for x in ast.walk(c.target) if isinstance(x, ast.Name)}
+            for n in ast.walk(st):
+                if isinstance(n, ast.Name):
+                    if n.id not in comp:
+                        ment.add(n.id)
+                        if isinstance(n.ctx, ast.Store):
+                            loc.add(n.id)
+                elif isinstance(n, ast.Attribute):
+                    ment.add(n.attr)
+                    if isinstance(n.ctx, ast.Store):
+                        glo.add(n.attr)
+                elif isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value.isidentifier():
+                    ment.add(n.value)
+                tgt = None
+                if isinstance(n, ast.Subscript) and isinstance(n.ctx, ast.Store):
+                    tgt = n.value
+                elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in MUT:
+                    tgt = n.func.value
+                if isinstance(tgt, ast.Name):
+                    loc.add(tgt.id)
+                elif isinstance(tgt, ast.Attribute):
+                    glo.add(tgt.attr)
+            return ment, loc, glo
+
+        glob = set(start)
+        while True:
+            before = len(glob)
+            pat = re.compile(r"\b(?:" + "|".join(map(re.escape, sorted(glob))) + r")\b")
+            for p, ent in self._pyfiles.items():
+                if not pat.search(ent[0]):
+                    continue
+                if ent[1] is None:
+                    try:
+                        tree = ast.parse(ent[0])
+                    except SyntaxError:
+                        return None
+                    ent[1] = [(is_mod, [info(st) for st in sts]) for is_mod, sts in scopes(tree)]
+                for is_mod, infos in ent[1]:
+                    local = set()
+                    grew = True
+                    while grew:
+                        grew = False
+                        for ment, loc, glo in infos:
+                            if ment & glob or ment & local:
+                                new_g = glo | (loc if is_mod else set())
+                                new_l = set() if is_mod else loc
+                                if not new_g <= glob or not new_l <= local:
+                                    glob |= new_g
+                                    local |= new_l
+                                    grew = True
+                    if len(glob) > limit:
+                        return None
+            if len(glob) == before:
+                return {g for g in glob if g not in COMMON_WORDS and len(g) > 1}
+
     def class_users(self, name):
         """tests that can hold an instance of class `name` or of a subclass: code lines and test
         code naming any of them, plus their SQL function names (ArrayContains -> ARRAY_CONTAINS)."""
@@ -599,6 +701,25 @@ def select_python(ctx, rel, f, reasons):
                     narrowed |= cov.get(ln, set())
             if narrowed:
                 return narrowed
+        if (stem and inner is not None and stmt is not None and any(stmt is b for b in inner.body)
+                and isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign))):
+            # a dialect's class attribute: follow it (and whatever sqlglot builds from it when the
+            # class is created) to the code that reads it, among the tests that use this dialect
+            attrs = {n for n in assigned_names(stmt) if n not in COMMON_WORDS}
+            der = ctx.derived_attrs(attrs) if attrs else None
+            if der:
+                users = ctx.stem_users[stem]
+                hits = set()
+                for d in der:
+                    hits |= wi.get(d, set())
+                    hits |= ctx.testwords.get(d, set())
+                narrowed = hits & users
+                if tree is old_tree:
+                    for ln in range(max(line - 1, 1), line + 2):
+                        narrowed |= cov.get(ln, set())
+                if narrowed:
+                    reasons.append(f"{rel}: {sorted(attrs)[:3]} -> {len(der)} names, {len(narrowed)} tests")
+                    return narrowed
         if stem:
             # class tables are often copied or renamed when the class is built, so names can't be
             # traced reliably: every test that uses this dialect (or one built on it)
